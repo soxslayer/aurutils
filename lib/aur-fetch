@@ -6,11 +6,21 @@ AUR_LOCATION=${AUR_LOCATION:-https://aur.archlinux.org}
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[1]}(): }'
 
-# default options
-verbose=0 recurse=0 fetch_args=('--verbose') confirm_seen=0
+# default arguments
+pull_args=('--verbose')
 
-gen_patchfile() {
-    git diff-tree --patch --stat "${2:-$(git hash-object -t tree /dev/null)}" "$1"
+# default options
+verbose=0 recurse=0 confirm_seen=0 rebase=-1 log_format=diff log_cmd=diff
+n_procs=$(nproc)
+
+# empty tree object
+git_empty_tree=$(git hash-object -t tree /dev/null)
+
+trap_exit() {
+    # Do not remove error files if an error occured (#593)
+    if [[ ! -v AUR_DEBUG ]]; then
+        rm -rf "$tmp"
+    fi
 }
 
 usage() {
@@ -18,7 +28,7 @@ usage() {
 ICAgICAgICAgICAgIC4tLX5+LF9fCjotLi4uLiwtLS0tLS0tYH5+Jy5fLicKIGAtLCwsICAs
 XyAgICAgIDsnflUnCiAgXywtJyAsJ2AtX187ICctLS4KIChfLyd+fiAgICAgICcnJycoOwoK
 !
-    plain 'usage: %s [-L directory] [-rv] pkgname...' "$argv0" >&2
+    plain >&2 'usage: %s [-L directory] [-frv] pkgname...' "$argv0"
     exit 1
 }
 
@@ -27,10 +37,12 @@ source /usr/share/makepkg/util/parseopts.sh
 
 if [[ ! -v NO_COLOR ]] && [[ ! -v AUR_DEBUG ]]; then
     [[ -t 2 ]] && colorize
+    git_color='--color'
 fi
 
-opt_short='rvL:'
-opt_long=('recurse' 'verbose' 'write-log:' 'force' 'confirm-seen')
+opt_short='frRvL:'
+opt_long=('recurse' 'verbose' 'write-log:' 'force' 'confirm-seen'
+          'rebase' 'reset' 'format:' 'jobs:')
 opt_hidden=('dump-options')
 
 if ! parseopts "$opt_short" "${opt_long[@]}" "${opt_hidden[@]}" -- "$@"; then
@@ -47,18 +59,34 @@ while true; do
             recurse=1 ;;
         -v|--verbose)
             verbose=1 ;;
+        --format)
+            shift
+            log_format=$1 ;;
+        --jobs)
+            shift
+            n_procs=$1 ;;
+        -R|--rebase)
+            rebase=1 ;;
+        --reset)
+            rebase=0 ;;
         --force)
             fetch_args+=('--force') ;;
         --confirm-seen)
             confirm_seen=1 ;;
         --dump-options)
-            printf -- '--%s\n' "${opt_long[@]}" 
+            printf -- '--%s\n' "${opt_long[@]}"
             printf -- '%s' "${opt_short}" | sed 's/.:\?/-&\n/g'
             exit ;;
         --) shift; break ;;
     esac
     shift
 done
+
+case "$log_format" in
+    log)  log_cmd=log ;;
+    diff) log_cmd=diff ;;
+    *)    error '%s format is not supported' "$log_format" && exit 1
+esac
 
 if [[ -v $log_dir ]] && [[ ! -d $log_dir ]]; then
     error '%s: %s: Not a directory' "$argv0" "$log_dir"
@@ -70,69 +98,123 @@ if ! (( $# )); then
     exit 1
 fi
 
-# Prepare configuration directory.
-mkdir -p "$XDG_CONFIG_HOME"/aurutils/$argv0
+if (( confirm_seen )); then
+    msg 'Marking repositories as seen' >&2
+fi
 
 # Default to showing PKGBUILD first in patch. (#399)
+mkdir -p "$XDG_CONFIG_HOME/aurutils/$argv0"
 orderfile=$XDG_CONFIG_HOME/aurutils/$argv0/orderfile
 
-if [[ ! -s $orderfile ]]; then
-    printf 'PKGBUILD\n' > "$orderfile"
+if ! [[ -s $orderfile ]]; then
+    printf 'PKGBUILD\n' >"$orderfile"
 fi
 
-if (( confirm_seen )); then
-    msg "Marking repositories as seen"
-fi
+tmp=$(mktemp -d --tmpdir "aurutils-$argv0.XXXXXXXX") || exit
+trap 'trap_exit' EXIT
+
+aur_fetch() {
+    pkg=$1
+    # Avoid issues with filesystem boundaries. (#274)
+    export GIT_DIR=$pkg/.git GIT_WORK_TREE=$pkg
+
+    if ! [[ -e $pkg ]]; then
+        if ! git clone "$AUR_LOCATION/$pkg".git "$GIT_DIR"; then
+            error '%s: %s: Failed to clone repository' "$argv0" "$pkg"
+            exit 1
+        fi
+
+        # Show PKGBUILDs first. (#399)
+        git config diff.orderFile "$orderfile"
+
+        if (( confirm_seen )); then
+            git update-ref AURUTILS_SEEN HEAD
+
+            warning 'Marked new repository %s as seen' "$pkg"
+            exit 0 # skip diff logic
+        else
+            # Set marker to empty tree object.
+            git update-ref AURUTILS_SEEN "$git_empty_tree"
+
+            # This case may be handled differently from an existing repo where
+            # the AURUTILS_SEEN ref does not exist; here, we know that the repo
+            # is at the current HEAD, and a git pull is not required.
+            : cloned repository was not inspected
+        fi
+    else
+        # Ensure a valid git repository. (#586)
+        if ! git rev-parse --git-dir; then
+            # The original git rev-parse exit code on a malformed git
+            # repository is 128, or EKEYREVOKED in errno.h.
+            exit 1
+        fi
+
+        if (( confirm_seen )); then
+            git update-ref AURUTILS_SEEN HEAD
+
+            msg2 'Marked %s as seen' "$pkg" >&2
+            exit 0
+        fi
+
+        if (( rebase > 0 )) || {
+               (( rebase < 0 )) && [[ $(git config --get --bool aurutils.rebase) == "true" ]]
+           }; then
+            git reset --hard HEAD >&2
+
+            if ! git pull --rebase "${pull_args[@]}"; then
+                error '%s: %s: Failed to integrate changes' "$argv0" "$pkg"
+                exit 1
+            fi
+        else
+            git fetch -v >&2
+            git reset --hard 'HEAD@{upstream}' >&2
+        fi
+    fi
+
+    if ! seen=$(git rev-parse --quiet --verify AURUTILS_SEEN); then
+        seen=$git_empty_tree
+        warning '%s: AURUTILS_SEEN object not found, assuming empty tree' "$argv0"
+    fi
+
+    if [[ $seen != "$(git rev-parse HEAD)" ]]; then
+        # Contents have changed since last inspection; print differences.
+        if (( verbose )); then
+            git --no-pager "$log_cmd" ${git_color} --patch --stat "${seen:+$seen..}HEAD"
+        fi
+
+        if [[ $log_dir ]]; then
+            git --no-pager "$log_cmd" --patch --stat "${seen:+$seen..}HEAD" >"$log_dir/$pkg.${log_format}"
+        fi
+    fi
+}
+
 
 if (( recurse )); then
     aur depends --pkgbase "$@"
 else
-   printf '%s\n' "$@"
-fi | while read -r pkg; do
-    if [[ ! -e $pkg ]]; then
-        if git clone "$AUR_LOCATION"/"$pkg".git; then
-            # show PKGBUILDS first (#399)
-            git -C "$pkg" config diff.orderFile "$orderfile"
-            # only allow fast-forward fetches. (#)
-            git -C "$pkg" config remote.origin.fetch 'refs/heads/*:refs/remotes/origin/*'
-        else
-            error '%s: %s: Failed to clone repository' "$argv0" "$pkg"
-            exit 1
-        fi
+    printf '%s\n' "$@"
+fi >"$tmp/queue"
+
+i=0 # "allocate" slots
+while (( i++ < n_procs )); do true & done
+
+# run jobs. We need to go through the loop n_proc more times to
+# to ensure we read exit codes from processes that are still running
+# when the queue finishes.
+while { read -r pkg || (( --i > 0 )); } ; do
+    wait -n || { ret=$?; break; }               #simulate fail=1 from now,fail=1
+    if [[ $pkg ]]; then
+        aur_fetch "$pkg" >"$tmp/$pkg.out" 2>"$tmp/$pkg.err" &
     fi
-    # Avoid issues with filesystem boundaries, (#274)
-    # and make sure we have a valid git repository.
-    GIT_DIR=$(git rev-parse --resolve-git-dir "$pkg"/.git) || exit
-    export GIT_DIR GIT_WORK_TREE=$pkg
+done < <(sort -u "$tmp/queue" | sed '/^$/d')
 
-    if (( confirm_seen )); then
-        git update-ref AURUTILS_SEEN HEAD
-        msg2 'Marked %s as seen' "$pkg"
-        continue
-    fi
+if (( ret )); then # simulate now from now,fail=1
+    # shellcheck disable=SC2046
+    kill $(jobs -np)
+fi
 
-    # Discard any local uncommited changes. (#552)
-    git reset --hard HEAD >&2
-    if ! git pull --rebase "${fetch_args[@]}"; then
-        error '%s: Failed to integrate changes.' "$pkg"
-        exit 1
-    fi
-
-    seen=$(git rev-parse --quiet --verify AURUTILS_SEEN)
-
-    if [[ "$seen" != $(git rev-parse HEAD) ]]; then
-        log_range=(HEAD ${seen:+^$seen})
-
-        if (( verbose )); then
-            gen_patchfile "${log_range[@]}"
-        fi
-
-        if [[ $log_dir ]]; then
-            logfile="$log_dir/$pkg".patch
-            gen_patchfile "${log_range[@]}" >"$logfile"
-            plain '%s' "$logfile"
-        fi
-    fi
-done
-
+wait # wait for process to terminate
+cat "$tmp/"*.out
+cat "$tmp/"*.err >&2
+exit $ret
 # vim: set et sw=4 sts=4 ft=sh:
