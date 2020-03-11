@@ -9,7 +9,7 @@ AURDEST=${AURDEST:-$XDG_CACHE_HOME/aurutils/$argv0}
 PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
 
 # default arguments
-build_args=(--clean --syncdeps)
+build_args=(--clean --syncdeps --rmdeps)
 build_extra_args=()
 repo_args=()
 

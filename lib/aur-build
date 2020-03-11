@@ -15,7 +15,7 @@ chroot=0 no_sync=0 overwrite=0 sign_pkg=0 run_pkgver=0 results=0 prefix=aur
 chroot_args=()
 conf_args=()
 gpg_args=(--detach-sign --no-armor --batch)
-makepkg_args=(--nodeps)
+makepkg_args=()
 makechrootpkg_args=(-cu)
 repo_add_args=()
 repo_args=()
